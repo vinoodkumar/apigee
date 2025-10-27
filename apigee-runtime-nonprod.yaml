@@ -15,6 +15,10 @@ on:
         description: 'GCP Project ID'
         required: true
         default: 'helix-apigee-nprd'
+      apigee_project:
+        description: 'Apigee Project ID (where SA secret is stored) - REQUIRED'
+        required: true
+        default: ''
       env:
         description: 'Environment (non-prod/prod)'
         required: true
@@ -31,6 +35,10 @@ on:
         description: 'Optional base64 TLS key to create secret if missing'
         required: false
         default: ''
+      sa_secret_name:
+        description: 'Secret Manager secret name that contains the Apigee SA JSON'
+        required: true
+        default: 'apigee-non-prod-sa'
       dry_run:
         description: 'true = dry-run, false = actual install'
         required: true
@@ -55,6 +63,17 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Validate required CLIs on runner
+        run: |
+          set -e
+          for cmd in gcloud kubectl helm jq curl; do
+            if ! command -v $cmd >/dev/null 2>&1; then
+              echo "::error::Required CLI '$cmd' is missing on runner. Please ensure runner image has it installed."
+              exit 2
+            fi
+          done
+          echo "All required CLIs present."
 
       # --- GCP Authentication ---
       - name: Gcp Authentication
@@ -84,162 +103,135 @@ jobs:
         env:
          KUBECONFIG: ${{ github.workspace }}/.kube/config
         run: kubectl get nodes --show-labels
-                
 
-      # # --- Kubeconfig validation / write to file ---
-      # - name: Validate kubeconfig secret
-      #   run: |
-      #     if [ -z "${{ secrets.KUBECONFIG_BASE64 }}" ]; then
-      #       echo "ERROR: secrets.KUBECONFIG_BASE64 is required" >&2
-      #       exit 1
-      #     fi
-      #     echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 --decode > "${KUBECONFIG_PATH}"
-      #     chmod 600 "${KUBECONFIG_PATH}"
-      #     echo "Wrote kubeconfig to ${KUBECONFIG_PATH}"
+      - name: Validate apigee_project input
+        id: validate_apigee_proj
+        shell: bash
+        run: |
+          set -euo pipefail
+          APIGEE_PROJECT_INPUT="${{ github.event.inputs.apigee_project }}"
+          if [ -z "${APIGEE_PROJECT_INPUT}" ]; then
+            echo "::error::The workflow input 'apigee_project' is required and is not set."
+            exit 2
+          fi
+          echo "apigee_project=${APIGEE_PROJECT_INPUT}" >> $GITHUB_OUTPUT
+          echo "Using apigee_project: ${APIGEE_PROJECT_INPUT}"
 
-      # # --- Fetch Secrets (placeholder) ---
-      # - name: Fetch Secrets
-      #   run: |
+      # --- Download charts (if not already downloaded) ---
+      - name: Download Apigee Helm charts
+        run: |
+          set -e
+          mkdir -p "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
+          cd "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
+          export HELM_EXPERIMENTAL_OCI=1
+          helm pull "${CHART_REPO}/apigee-operator" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-datastore" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-env" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-ingress-manager" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-org" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-redis" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-telemetry" --version "${{ github.event.inputs.chart_version }}" --untar
+          helm pull "${CHART_REPO}/apigee-virtualhost" --version "${{ github.event.inputs.chart_version }}" --untar
+          cd "${GITHUB_WORKSPACE}"
+          echo "Helm charts downloaded to ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
 
+      # --- Create service account (fetch SA JSON from Secret Manager and copy to charts)
+      - name: Create service account
+        env:
+          APIGEE_PROJECT: ${{ steps.validate_apigee_proj.outputs.apigee_project }}
+          SA_SECRET_NAME: ${{ github.event.inputs.sa_secret_name }}
+        run: |
+          set -euo pipefail
+          echo "Fetching Apigee Service Account JSON from Secret Manager (project: ${APIGEE_PROJECT})"
+          SECRET_NAME="${SA_SECRET_NAME}"
+          SA_DIR="${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore"
+          mkdir -p "${SA_DIR}"
+          SA_JSON_FILE="${SA_DIR}/${APIGEE_PROJECT}-apigee-non-prod.json"
+          # fetch latest secret version
+          if ! gcloud secrets versions access latest --secret="${SECRET_NAME}" --project="${APIGEE_PROJECT}" > "${SA_JSON_FILE}" 2>/tmp/_secret_err; then
+            echo "::error::Failed to fetch secret '${SECRET_NAME}' from project '${APIGEE_PROJECT}'."
+            sed -n '1,200p' /tmp/_secret_err || true
+            echo "::error::Ensure the installer SA (GCP_SA_KEY) has roles/secretmanager.secretAccessor on project ${APIGEE_PROJECT}."
+            exit 9
+          fi
+          if [ ! -s "${SA_JSON_FILE}" ]; then
+            echo "::error::Fetched secret file is empty: ${SA_JSON_FILE}"
+            exit 10
+          fi
+          echo "Service account JSON saved to ${SA_JSON_FILE}"
 
-      # - name: Ensure Namespace exists
-      #   run: |
-      #     ns="${{ github.event.inputs.namespace}}"
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" get namespace "${ns}" >/dev/null 2>&1 || kubectl --kubeconfig="${KUBECONFIG_PATH}" create namespace "${ns}"
-      #     echo "Using namespace: ${ns}"
+          TARGET_DIRS=( "apigee-datastore" "apigee-telemetry" "apigee-org" "apigee-env" )
+          for target in "${TARGET_DIRS[@]}"; do
+            TPATH="${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/${target}"
+            if [ -d "${TPATH}" ]; then
+              cp -f "${SA_JSON_FILE}" "${TPATH}/"
+              echo "Copied SA JSON to ${TPATH}/"
+            else
+              echo "Warning: target chart path ${TPATH} not found (chart may be downloaded later)."
+            fi
+          done
 
-      # - name: Download Apigee Helm charts
-      #   run: |
-      #     set -e
-      #     mkdir -p "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
-      #     cd "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
-      #     export HELM_EXPERIMENTAL_OCI=1
-      #     helm pull "${CHART_REPO}/apigee-operator" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-datastore" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-env" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-ingress-manager" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-org" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-redis" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-telemetry" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-virtualhost" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     cd "${GITHUB_WORKSPACE}"
-      #     echo "Helm charts downloaded to ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
+      # --- Prepare overrides.yaml ---
+      - name: Prepare overrides.yaml
+        run: |
+          ENV="${{ github.event.inputs.env }}"
+          if [ -f "./templates/overrides.${ENV}.yaml" ]; then
+            cp "./templates/overrides.${ENV}.yaml" ./overrides.yaml
+          elif [ -f "./templates/overrides.yaml" ]; then
+            cp "./templates/overrides.yaml" ./overrides.yaml
+          else
+            echo "ERROR: overrides.yaml not found." >&2
+            exit 1
+          fi
 
-      # - name: Create service account
-      #   env:
-      #     PROJECT_ID: ${{ github.event.inputs.project_id }}
-      #   run: |
-      #     set -e
-      #     TOOL="${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator/etc/tools/create-service-account"
-      #     if [ ! -f "${TOOL}" ]; then
-      #        echo "ERROR: create-service-account tool not found at ${TOOL}" >&2
-      #        exit 5
-      #     fi
-      #     chmod +x "${TOOL}" || true
+      - name: Apply Apigee CRDs
+        run: |
+          kubectl --kubeconfig="${KUBECONFIG_PATH}" apply -k "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator/etc/crds/default/"
 
-      #     # pick SA local-part depending on env
-      #     if [ "${{ github.event.inputs.env }}" = "non-prod" ] || [ "${{ github.event.inputs.env }}" = "nonprod" ]; then
-      #       SA_LOCAL="apigee-non-prod"
-      #     else
-      #       SA_LOCAL="apigee-datastore"
-      #     fi
+      - name: Install cert-manager
+        run: |
+          if kubectl --kubeconfig="${KUBECONFIG_PATH}" -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
+            echo "cert-manager already installed."
+          else
+            echo "Installing cert-manager v1.12.0..."
+            kubectl --kubeconfig="${KUBECONFIG_PATH}" apply --validate=false -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
+            kubectl --kubeconfig="${KUBECONFIG_PATH}" -n cert-manager rollout status deploy/cert-manager --timeout=180s
+          fi
 
-      #     SERVICE_ACCOUNT="${SA_LOCAL}@${PROJECT_ID}.iam.gserviceaccount.com"
-      #     echo "Checking if service account ${SERVICE_ACCOUNT} exists in project ${PROJECT_ID}..."
-      #     # fixed format string and grep; ensure gcloud present and authenticated
-      #     if gcloud iam service-accounts list --project="${PROJECT_ID}" --format='value(email)' | grep -q "^${SERVICE_ACCOUNT}$"; then
-      #       echo "Service account ${SERVICE_ACCOUNT} already exists. Skipping creation."
-      #     else
-      #       echo "Service account ${SERVICE_ACCOUNT} not found. Creating ${SERVICE_ACCOUNT} (non-interactive)..."
-      #       DEST_DIR="${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore"
-      #       mkdir -p "${DEST_DIR}"
-      #       yes | "${TOOL}"  --env non-prod  --dir "${DEST_DIR}" --project-id "${PROJECT_ID}"
-      #       echo "create-service-account finished."
-      #     fi
+      - name: Install apigee-operator
+        run: |
+          set -e
+          cd "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            helm upgrade apigee-operator . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --dry-run=server --debug
+          else
+            helm upgrade apigee-operator . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --wait --timeout 20m
+          fi
 
-      #     # verify SA JSON now exists in apigee-datastore and copy to other charts
-      #     SA_JSON="$(ls ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore/*.json 2>/dev/null | head -n1 || true)"
-      #     if [ -z "${SA_JSON}" ]; then
-      #       echo "ERROR: SA JSON not found in ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore after running tool (or tool skipped)." >&2
-      #       exit 6
-      #     fi
-      #     echo "Found SA JSON: ${SA_JSON}"
-         
-      #     # Copy the JSON to charts that need it (telemetry, org, env)
-      #     for target in apigee-telemetry apigee-org apigee-env; do
-      #       if [ -d "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/${target}" ]; then
-      #         cp -f "${SA_JSON}" "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/${target}/" || true
-      #         echo "Copied SA JSON to ${target}/"
-      #       fi
-      #     done
+      - name: Install remaining Apigee charts
+        run: |
+          set -e
+          charts="apigee-datastore apigee-redis apigee-telemetry apigee-env apigee-ingress-manager apigee-virtualhost apigee-org"
+          for c in $charts; do
+            cd "${GITHUB_WORKSPACE}/${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/$c"
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              helm upgrade "$c" . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --dry-run=server --debug
+            else
+              helm upgrade "$c" . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --wait --timeout 20m
+            fi
+          done
 
-      # - name: Ensure TLS Certificate Secret
-      #   run: |
-      #     set -e
-      #     NS="${{ github.event.inputs.namespace }}"
+      - name: Post-install verification
+        run: |
+          ns="${{ github.event.inputs.namespace }}"
+          kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get pods --show-labels || true
+          kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get pvc || true
+          kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get apigeeorg || true
 
-
-      # - name: Prepare overrides.yaml
-      #   run: |
-      #     ENV="${{ github.event.inputs.env }}"
-      #     if [ -f "./templates/overrides.${ENV}.yaml" ]; then
-      #       cp "./templates/overrides.${ENV}.yaml" ./overrides.yaml
-      #     elif [ -f "./templates/overrides.yaml" ]; then
-      #       cp "./templates/overrides.yaml" ./overrides.yaml
-      #     else
-      #       echo "ERROR: overrides.yaml not found." >&2
-      #       exit 1
-      #     fi
-
-      # - name: Apply Apigee CRDs
-      #   run: |
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" apply -k "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator/etc/crds/default/"
-
-      # - name: Install cert-manager
-      #   run: |
-      #     if kubectl --kubeconfig="${KUBECONFIG_PATH}" -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
-      #       echo "cert-manager already installed."
-      #     else
-      #       echo "Installing cert-manager v1.12.0..."
-      #       kubectl --kubeconfig="${KUBECONFIG_PATH}" apply --validate=false -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
-      #       kubectl --kubeconfig="${KUBECONFIG_PATH}" -n cert-manager rollout status deploy/cert-manager --timeout=180s
-      #     fi
-      # - name: Install apigee-operator
-      #   run: |
-      #     set -e
-      #     cd "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator"
-      #     if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-      #       helm upgrade apigee-operator . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --dry-run=server --debug
-      #     else
-      #       helm upgrade apigee-operator . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --wait --timeout 20m
-      #     fi
-
-      # - name: Install remaining Apigee charts
-      #   run: |
-      #     set -e
-      #     charts="apigee-datastore apigee-redis apigee-telemetry apigee-env apigee-ingress-manager apigee-virtualhost apigee-org"
-      #     for c in $charts; do
-      #       cd "${GITHUB_WORKSPACE}/${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/$c"
-      #       if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-      #         helm upgrade "$c" . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --dry-run=server --debug
-      #       else
-      #         helm upgrade "$c" . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --wait --timeout 20m
-      #       fi
-      #     done
-
-      # - name: Post-install verification
-      #   run: |
-      #     ns="${{ github.event.inputs.namespace }}"
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get pods --show-labels || true
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get pvc || true
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get apigeeorg || true
-
-      # - name: Done
-      #   run: |
-      #     if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-      #       echo "Dry-run complete. Re-run with dry_run=false to perform install."
-      #     else
-      #       echo "Install finished."
-      #     fi
-
-      
+      - name: Done
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Dry-run complete. Re-run with dry_run=false to perform install."
+          else
+            echo "Install finished."
+          fi
