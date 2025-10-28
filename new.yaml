@@ -1,35 +1,45 @@
-name: Apigee Hybrid - Create Org & Env Group (Validated with Error Capture)
+name: Apigee Hybrid - Create Org & Env Group
 
 on:
   workflow_dispatch:
     inputs:
       apigee_project:
-        description: "Project ID where Apigee Org will be created (e.g. eqx-entapg-nonprod)"
+        description: "Project ID where Apigee Org will be created (e.g. eq-nonprod)"
         required: true
+        default: 'eqx-entapg-nonprod'
+      cluster_project:
+        description: "Project ID where GKE cluster exists (e.g. helix)"
+        required: true
+        default: 'helix-apigee-nprd'
       analytics_region:
         description: "Analytics Region (e.g. us-central1)"
         required: true
+        default: 'us-west1'
       runtime_type:
         description: "Runtime Type (HYBRID)"
         default: "HYBRID"
         required: true
-      env_group_name:
-        description: "Name of Apigee Environment Group"
-        required: true
-      host_name:
-        description: "Host name for the environment group (e.g. api.nonprod.example.com)"
-        required: true
+      # env_group_name:
+      #   description: "Name of Apigee Environment Group"
+      #   required: true
+      #   default: ''
+      # host_name:
+      #   description: "Host name for the environment group (e.g. api.nonprod.example.com)"
+      #   required: true
+      #   default: ''
 
 jobs:
-  apigee-org-envgroup:
-    runs-on: ubuntu-latest
+  apigee-org:
+    runs-on: ${{ github.event.inputs.ENVIRONMENT == 'prod' && 'prod_infra_boomi' || 'apigee_np' }}
+
     env:
       APIGEE_PROJECT: ${{ github.event.inputs.apigee_project }}
+      CLUSTER_PROJECT: ${{ github.event.inputs.cluster_project }}
       ANALYTICS_REGION: ${{ github.event.inputs.analytics_region }}
       RUNTIMETYPE: ${{ github.event.inputs.runtime_type }}
       ORG_NAME: ${{ github.event.inputs.apigee_project }}
-      ENV_GROUP: ${{ github.event.inputs.env_group_name }}
-      HOSTNAME: ${{ github.event.inputs.host_name }}
+      # ENV_GROUP: ${{ github.event.inputs.env_group_name }}
+      # HOSTNAME: ${{ github.event.inputs.host_name }}
 
     steps:
       - name: Checkout
@@ -40,12 +50,6 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Install Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v1
-        with:
-          project_id: ${{ env.APIGEE_PROJECT }}
-          export_default_credentials: true
-
       - name: Generate Access Token
         id: token
         run: |
@@ -53,128 +57,140 @@ jobs:
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       # ------------------------------------------------------------
-      # Helper Function: Unified API Caller with Error Logging
+      # VALIDATE PROJECT ENTITLEMENT AND EXISTING ORG
       # ------------------------------------------------------------
-      - name: Define API Helper
-        id: define_helper
+      - name: Validate Apigee Entitlement and Org Existence
+        id: validate_org
         run: |
-          cat <<'EOF' > api_helper.sh
-          #!/bin/bash
-          set -e
+          echo "🔍 Validating Apigee entitlement and existing organization for project ${APIGEE_PROJECT}"
 
-          METHOD=$1
-          URL=$2
-          DATA=$3
-          TOKEN=$4
+          EXISTING_ORG=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}" | jq -r '.name' 2>/dev/null || echo "")
 
-          echo "📡 Calling: $METHOD $URL"
-          if [ -n "$DATA" ]; then
-            echo "Request body: $DATA"
-            RESPONSE=$(curl -s -X "$METHOD" -H "Authorization: Bearer $TOKEN" \
-              -H "Content-Type: application/json" -d "$DATA" "$URL" -w "\n%{http_code}")
-          else
-            RESPONSE=$(curl -s -X "$METHOD" -H "Authorization: Bearer $TOKEN" "$URL" -w "\n%{http_code}")
+          if [[ "$EXISTING_ORG" == "$ORG_NAME" ]]; then
+            echo "✅ Organization '${ORG_NAME}' already exists. Skipping creation."
+            echo "org_exists=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          BODY=$(echo "$RESPONSE" | head -n1)
-          CODE=$(echo "$RESPONSE" | tail -n1)
-
-          echo "--------------------"
-          echo "HTTP Status: $CODE"
-          echo "Full API Response:"
-          echo "$BODY" | jq .
-          echo "--------------------"
-
-          if [ "$CODE" -ge 400 ]; then
-            MESSAGE=$(echo "$BODY" | jq -r '.error.message // "Unknown error"')
-            echo "❌ API call failed with HTTP $CODE"
-            echo "Error: $MESSAGE"
+          ENTITLEMENT_CHECK=$(gcloud alpha apigee organizations describe ${ORG_NAME} --project ${APIGEE_PROJECT} 2>&1 || true)
+          if echo "$ENTITLEMENT_CHECK" | grep -qi "does not have an Apigee entitlement"; then
+            echo "❌ Project ${APIGEE_PROJECT} is not Apigee-entitled. Contact Google Cloud Sales."
             exit 1
           fi
 
-          echo "$BODY" > response.json
-          EOF
-
-          chmod +x api_helper.sh
+          echo "org_exists=false" >> $GITHUB_OUTPUT
+          echo "✅ No existing Apigee organization found. Proceeding with creation."
 
       # ------------------------------------------------------------
       # STEP 2 : CREATE APIGEE ORGANIZATION
       # ------------------------------------------------------------
-      - name: Check if Org Already Exists
-        id: check_org
-        run: |
-          ./api_helper.sh GET "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}" "" "${{ steps.token.outputs.token }}" || true
-          if grep -q '"error"' response.json; then
-            echo "org_exists=false" >> $GITHUB_OUTPUT
-            echo "ℹ️ No existing Apigee organization found. Proceeding with creation."
-          else
-            echo "org_exists=true" >> $GITHUB_OUTPUT
-            echo "✅ Organization ${ORG_NAME} already exists. Skipping creation."
-          fi
-
       - name: Create Apigee Organization
-        if: steps.check_org.outputs.org_exists == 'false'
+        if: steps.validate_org.outputs.org_exists == 'false'
         id: create_org
         run: |
-          DATA=$(cat <<EOF
-          {
-            "name": "${ORG_NAME}",
-            "runtimeType": "${RUNTIMETYPE}",
-            "analyticsRegion": "${ANALYTICS_REGION}"
-          }
-          EOF
-          )
-          ./api_helper.sh POST "https://apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT}" "$DATA" "${{ steps.token.outputs.token }}"
+          echo "🚀 Creating Apigee organization: ${ORG_NAME}"
 
-          LONG_OP=$(jq -r '.name' response.json | awk -F'/' '{print $4}')
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name":"'"${ORG_NAME}"'",
+              "runtimeType":"'"${RUNTIMETYPE}"'",
+              "analyticsRegion":"'"${ANALYTICS_REGION}"'"
+            }' \
+            "https://apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT}")
+
+          BODY=$(echo "$RESPONSE" | head -n1)
+          CODE=$(echo "$RESPONSE" | tail -n1)
+
+          if [ "$CODE" -ge 400 ]; then
+            echo "❌ Org creation failed with HTTP $CODE"
+            echo "$BODY"
+            exit 1
+          fi
+
+          LONG_OP=$(echo "$BODY" | grep -o '"operations/[^"]*' | sed 's/"operations\///')
+          if [ -z "$LONG_OP" ]; then
+            echo "⚠️ Could not parse long-running operation ID. Raw response:"
+            echo "$BODY"
+            exit 1
+          fi
+
           echo "operation_id=$LONG_OP" >> $GITHUB_OUTPUT
+          echo "✅ Org creation initiated. Operation ID: $LONG_OP"
 
-      - name: Wait for Org Creation
-        if: steps.check_org.outputs.org_exists == 'false'
+      - name: Wait for Organization Creation
+        if: steps.validate_org.outputs.org_exists == 'false'
         run: |
           echo "⏳ Waiting for organization creation to complete..."
-          for i in {1..20}; do
-            ./api_helper.sh GET "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/operations/${{ steps.create_org.outputs.operation_id }}" "" "${{ steps.token.outputs.token }}" || true
-            STATUS=$(jq -r '.metadata.state // empty' response.json)
-            echo "Attempt $i: $STATUS"
-            if [[ "$STATUS" == "FINISHED" || "$STATUS" == "SUCCESS" ]]; then
+          for i in {1..25}; do
+            STATUS=$(curl -s \
+              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+              "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/operations/${{ steps.create_org.outputs.operation_id }}" \
+              | grep -o '"state": *"[^"]*"' | awk -F '"' '{print $4}')
+            echo "Attempt $i: State=$STATUS"
+            if [ "$STATUS" == "FINISHED" ] || [ "$STATUS" == "SUCCESS" ]; then
               echo "✅ Organization creation completed."
               break
+            fi
+            if [ "$STATUS" == "FAILED" ]; then
+              echo "❌ Organization creation failed."
+              exit 1
             fi
             sleep 30
           done
 
       - name: Verify Organization
         run: |
-          ./api_helper.sh GET "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}" "" "${{ steps.token.outputs.token }}"
+          echo "📋 Verifying organization..."
+          curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}" | jq .
 
-      # ------------------------------------------------------------
-      # STEP 3 : CREATE ENVIRONMENT GROUP
-      # ------------------------------------------------------------
-      - name: Check if Environment Group Exists
-        id: check_envgroup
-        run: |
-          ./api_helper.sh GET "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" "" "${{ steps.token.outputs.token }}" || true
-          if grep -q '"error"' response.json; then
-            echo "envgroup_exists=false" >> $GITHUB_OUTPUT
-            echo "ℹ️ No existing environment group found. Proceeding with creation."
-          else
-            echo "envgroup_exists=true" >> $GITHUB_OUTPUT
-            echo "✅ Environment group ${ENV_GROUP} already exists. Skipping creation."
-          fi
+      # # ------------------------------------------------------------
+      # # STEP 3 : CREATE ENVIRONMENT GROUP (WITH VALIDATION)
+      # # ------------------------------------------------------------
+      # - name: Validate Existing Env Group
+      #   id: check_envgroup
+      #   run: |
+      #     EXISTING_GROUP=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+      #       "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" | jq -r '.name' 2>/dev/null || echo "")
 
-      - name: Create Environment Group
-        if: steps.check_envgroup.outputs.envgroup_exists == 'false'
-        run: |
-          DATA=$(cat <<EOF
-          {
-            "name": "${ENV_GROUP}",
-            "hostnames": ["${HOSTNAME}"]
-          }
-          EOF
-          )
-          ./api_helper.sh POST "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups" "$DATA" "${{ steps.token.outputs.token }}"
+      #     if [[ "$EXISTING_GROUP" == "organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" ]]; then
+      #       echo "✅ Environment group '${ENV_GROUP}' already exists. Skipping creation."
+      #       echo "envgroup_exists=true" >> $GITHUB_OUTPUT
+      #     else
+      #       echo "envgroup_exists=false" >> $GITHUB_OUTPUT
+      #       echo "ℹ️ No existing environment group found. Proceeding with creation."
+      #     fi
 
-      - name: Verify Environment Group
-        run: |
-          ./api_helper.sh GET "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" "" "${{ steps.token.outputs.token }}"
+      # - name: Create Environment Group
+      #   if: steps.check_envgroup.outputs.envgroup_exists == 'false'
+      #   run: |
+      #     echo "🚀 Creating Environment Group: ${ENV_GROUP}"
+
+      #     RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+      #       -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+      #       -H "Content-Type: application/json" \
+      #       -d '{
+      #         "name":"'"${ENV_GROUP}"'",
+      #         "hostnames":["'"${HOSTNAME}"'"]
+      #       }' \
+      #       "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups")
+
+      #     BODY=$(echo "$RESPONSE" | head -n1)
+      #     CODE=$(echo "$RESPONSE" | tail -n1)
+
+      #     if [ "$CODE" -ge 400 ]; then
+      #       echo "❌ Env group creation failed with HTTP $CODE"
+      #       echo "$BODY"
+      #       exit 1
+      #     fi
+
+      #     echo "✅ Environment group '${ENV_GROUP}' created successfully."
+
+      # - name: Verify Environment Group
+      #   run: |
+      #     echo "📋 Verifying environment group..."
+      #     curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+      #       "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" | jq .
