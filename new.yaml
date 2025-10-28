@@ -1,390 +1,197 @@
-name: Apigee Hybrid installation
+name: Apigee Hybrid - Create Org & Env Group (Validated, Cross-Project)
 
 on:
   workflow_dispatch:
     inputs:
-      chart_version:
-        description: 'Apigee Chart Version'
-        required: true
-        default: '1.14.0'
-      namespace:
-        description: 'K8s Namespace'
-        required: true
-        default: 'apigee-nonprod'
-      project_id:
-        description: 'GCP Project ID (cluster project)'
-        required: true
-        default: 'helix-apigee-nprd'
       apigee_project:
-        description: 'Apigee Project ID (org/env group target). If empty, project_id will be used'
-        required: false
-        default: ''
-      env:
-        description: 'Environment (non-prod/prod)'
+        description: "Project ID where Apigee Org will be created (e.g. eq-nonprod)"
         required: true
-        default: 'non-prod'
-      tls_secret_name:
-        description: 'TLS secret name expected by Apigee ingress'
+      cluster_project:
+        description: "Project ID where GKE cluster exists (e.g. helix)"
         required: true
-        default: 'apigee-tls'
-      tls_cert_base64:
-        description: 'Optional base64 TLS cert to create secret if missing'
-        required: false
-        default: ''
-      tls_key_base64:
-        description: 'Optional base64 TLS key to create secret if missing'
-        required: false
-        default: ''
-      dry_run:
-        description: 'true = dry-run, false = actual install'
+      analytics_region:
+        description: "Analytics Region (e.g. us-central1)"
         required: true
-        default: 'true'
-
-permissions:
-  id-token: write
-  contents: read
-
-env:
-  CHART_REPO: "oci://us-docker.pkg.dev/apigee-release/apigee-hybrid-helm-charts"
-  APIGEE_HYBRID_BASE: "apigee-hybrid"
-  APIGEE_HELM_CHARTS_HOME: "helm-charts"
-  PROJECT_ID: "helix-apigee-nprd"
-  SA_FILE_NAME: "helix-apigee-nprd-apigee-non-prod.json"
-  KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig
+      runtime_type:
+        description: "Runtime Type (HYBRID)"
+        default: "HYBRID"
+        required: true
+      env_group_name:
+        description: "Name of Apigee Environment Group"
+        required: true
+      host_name:
+        description: "Host name for the environment group (e.g. api.nonprod.example.com)"
+        required: true
 
 jobs:
-  Apigee-runtime-installation:
-    runs-on: ${{ github.event.inputs.ENVIRONMENT == 'prod' && 'prod_infra_boomi' || 'apigee_np' }}
+  apigee-validated:
+    runs-on: ubuntu-latest
+
+    env:
+      APIGEE_PROJECT: ${{ github.event.inputs.apigee_project }}
+      CLUSTER_PROJECT: ${{ github.event.inputs.cluster_project }}
+      ANALYTICS_REGION: ${{ github.event.inputs.analytics_region }}
+      RUNTIMETYPE: ${{ github.event.inputs.runtime_type }}
+      ORG_NAME: ${{ github.event.inputs.apigee_project }}
+      ENV_GROUP: ${{ github.event.inputs.env_group_name }}
+      HOSTNAME: ${{ github.event.inputs.host_name }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # --- GCP Authentication ---
-      - name: Gcp Authentication
-        uses: google-github-actions/auth@v1
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: '${{ secrets.GCP_SA_KEY }}'
-      - name: Set gcloud project
-        run: gcloud config set project ${PROJECT_ID}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      ############################################################################
-      # Apigee Step 2 & 3: Create / Verify Organization and Environment Group
-      # Inserted immediately after GCP authentication. Uses the currently-active
-      # gcloud auth (the action above) to request a token and call Apigee API.
-      ############################################################################
-      - name: Determine APIGEE_PROJECT to use
-        id: pick_apigee_proj
-        shell: bash
+      - name: Install Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.APIGEE_PROJECT }}
+          export_default_credentials: true
+
+      - name: Generate Access Token
+        id: token
         run: |
-          set -euo pipefail
-          # prefer explicit input apigee_project; fallback to project_id input
-          APIGEE_INPUT="${{ github.event.inputs.apigee_project || '' }}"
-          if [ -n "${APIGEE_INPUT}" ]; then
-            echo "apigee_project=${APIGEE_INPUT}" >> $GITHUB_OUTPUT
-            echo "Using provided apigee_project: ${APIGEE_INPUT}"
-          else
-            echo "apigee_project=${{ github.event.inputs.project_id }}" >> $GITHUB_OUTPUT
-            echo "No apigee_project provided; falling back to project_id: ${{ github.event.inputs.project_id }}"
-          fi
+          TOKEN=$(gcloud auth print-access-token)
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-      - name: Create / Verify Apigee Organization (Step 2)
-        shell: bash
-        env:
-          APIGEE_PROJECT: ${{ steps.pick_apigee_proj.outputs.apigee_project }}
-          APIGEE_ANALYTICS_REGION: "us-central1"
+      # ------------------------------------------------------------
+      # VALIDATE PROJECT ENTITLEMENT AND EXISTING ORG
+      # ------------------------------------------------------------
+      - name: Validate Apigee Entitlement and Org Existence
+        id: validate_org
         run: |
-          set -euo pipefail
+          echo "🔍 Validating Apigee entitlement and existing organization for project ${APIGEE_PROJECT}"
 
-          if [ -z "${APIGEE_PROJECT:-}" ]; then
-            echo "::error::APIGEE_PROJECT not set. Provide workflow input 'apigee_project' or 'project_id'."
-            exit 2
+          EXISTING_ORG=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}" | jq -r '.name' 2>/dev/null || echo "")
+
+          if [[ "$EXISTING_ORG" == "$ORG_NAME" ]]; then
+            echo "✅ Organization '${ORG_NAME}' already exists. Skipping creation."
+            echo "org_exists=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          # get bearer token from current gcloud auth (this action authenticates with secrets.GCP_SA_KEY)
-          TOKEN="$(gcloud auth print-access-token 2>/dev/null || true)"
-          if [ -z "${TOKEN}" ]; then
-            echo "::error::gcloud token unavailable. Ensure Gcp Authentication step succeeded."
-            exit 3
+          ENTITLEMENT_CHECK=$(gcloud alpha apigee organizations describe ${ORG_NAME} --project ${APIGEE_PROJECT} 2>&1 || true)
+          if echo "$ENTITLEMENT_CHECK" | grep -qi "does not have an Apigee entitlement"; then
+            echo "❌ Project ${APIGEE_PROJECT} is not Apigee-entitled. Contact Google Cloud Sales."
+            exit 1
           fi
-          AUTH_HDR="Authorization: Bearer ${TOKEN}"
 
-          ORG_NAME="${APIGEE_PROJECT}"
-          ORG_URL="https://apigee.googleapis.com/v1/organizations/${ORG_NAME}"
+          echo "org_exists=false" >> $GITHUB_OUTPUT
+          echo "✅ No existing Apigee organization found. Proceeding with creation."
 
-          echo "Checking Apigee organization '${ORG_NAME}' ..."
-          HTTP_CODE=$(curl -s -o /tmp/_org_check -w "%{http_code}" -H "${AUTH_HDR}" "${ORG_URL}" || true)
+      # ------------------------------------------------------------
+      # STEP 2 : CREATE APIGEE ORGANIZATION
+      # ------------------------------------------------------------
+      - name: Create Apigee Organization
+        if: steps.validate_org.outputs.org_exists == 'false'
+        id: create_org
+        run: |
+          echo "🚀 Creating Apigee organization: ${ORG_NAME}"
 
-          if [ "${HTTP_CODE}" = "200" ]; then
-            echo "Apigee org '${ORG_NAME}' already exists."
-          else
-            echo "Apigee org '${ORG_NAME}' not found (HTTP ${HTTP_CODE}). Attempting to create..."
-            CREATE_URL="https://apigee.googleapis.com/v1/organizations?organizationId=${ORG_NAME}"
-            read -r -d '' PAYLOAD <<EOF || true
-{
-  "projectId": "${APIGEE_PROJECT}",
-  "analyticsRegion": "${APIGEE_ANALYTICS_REGION}"
-}
-EOF
-            CREATE_CODE=$(curl -s -o /tmp/_org_create -w "%{http_code}" -X POST \
-              -H "${AUTH_HDR}" -H "Content-Type: application/json" \
-              -d "${PAYLOAD}" "${CREATE_URL}" || true)
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name":"'"${ORG_NAME}"'",
+              "runtimeType":"'"${RUNTIMETYPE}"'",
+              "analyticsRegion":"'"${ANALYTICS_REGION}"'"
+            }' \
+            "https://apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT}")
 
-            if [ "${CREATE_CODE}" = "200" ] || [ "${CREATE_CODE}" = "201" ]; then
-              echo "Apigee org '${ORG_NAME}' created successfully."
-            else
-              echo "---- Apigee org create response (HTTP ${CREATE_CODE}) ----"
-              sed -n '1,200p' /tmp/_org_create || true
-              echo "----------------------------------------------------------"
-              if [ "${CREATE_CODE}" = "403" ] || [ "${CREATE_CODE}" = "401" ]; then
-                echo "::error::Permission/entitlement error creating Apigee org."
-                echo "::error::Common causes: Apigee entitlement not provisioned in project, or authenticated SA lacks apigee.admin."
-                echo "::error::Action: ask CCoE to provision Apigee entitlements or provide an SA with apigee.admin on ${APIGEE_PROJECT}."
-              else
-                echo "::error::Failed to create Apigee org (HTTP ${CREATE_CODE}). See API response above."
-              fi
-              exit 5
+          BODY=$(echo "$RESPONSE" | head -n1)
+          CODE=$(echo "$RESPONSE" | tail -n1)
+
+          if [ "$CODE" -ge 400 ]; then
+            echo "❌ Org creation failed with HTTP $CODE"
+            echo "$BODY"
+            exit 1
+          fi
+
+          LONG_OP=$(echo "$BODY" | grep -o '"operations/[^"]*' | sed 's/"operations\///')
+          if [ -z "$LONG_OP" ]; then
+            echo "⚠️ Could not parse long-running operation ID. Raw response:"
+            echo "$BODY"
+            exit 1
+          fi
+
+          echo "operation_id=$LONG_OP" >> $GITHUB_OUTPUT
+          echo "✅ Org creation initiated. Operation ID: $LONG_OP"
+
+      - name: Wait for Organization Creation
+        if: steps.validate_org.outputs.org_exists == 'false'
+        run: |
+          echo "⏳ Waiting for organization creation to complete..."
+          for i in {1..25}; do
+            STATUS=$(curl -s \
+              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+              "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/operations/${{ steps.create_org.outputs.operation_id }}" \
+              | grep -o '"state": *"[^"]*"' | awk -F '"' '{print $4}')
+            echo "Attempt $i: State=$STATUS"
+            if [ "$STATUS" == "FINISHED" ] || [ "$STATUS" == "SUCCESS" ]; then
+              echo "✅ Organization creation completed."
+              break
             fi
-          fi
-
-      - name: Create / Verify Apigee Environment Group (Step 3)
-        shell: bash
-        env:
-          APIGEE_PROJECT: ${{ steps.pick_apigee_proj.outputs.apigee_project }}
-          ENVGROUP_NAME: ${{ github.event.inputs.envgroup_name || 'nonprod-group' }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${APIGEE_PROJECT:-}" ]; then
-            echo "::error::APIGEE_PROJECT not set. Provide workflow input 'apigee_project' or 'project_id'."
-            exit 2
-          fi
-
-          TOKEN="$(gcloud auth print-access-token 2>/dev/null || true)"
-          if [ -z "${TOKEN}" ]; then
-            echo "::error::gcloud token unavailable. Ensure Gcp Authentication step succeeded."
-            exit 3
-          fi
-          AUTH_HDR="Authorization: Bearer ${TOKEN}"
-
-          LIST_URL="https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT}/envgroups"
-          echo "Listing envgroups for org ${APIGEE_PROJECT} ..."
-          HTTP_CODE=$(curl -s -o /tmp/_eg_list -w "%{http_code}" -H "${AUTH_HDR}" "${LIST_URL}" || true)
-
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "::error::Unable to list environment groups for org ${APIGEE_PROJECT} (HTTP ${HTTP_CODE})."
-            sed -n '1,200p' /tmp/_eg_list || true
-            echo "::error::Check permissions and that org exists."
-            exit 6
-          fi
-
-          # API returns full resource names; search for trailing group name
-          if jq -r '.envgroups[]?.name // empty' /tmp/_eg_list | grep -qE "/${ENVGROUP_NAME}$"; then
-            echo "Environment group '${ENVGROUP_NAME}' already exists for org ${APIGEE_PROJECT}."
-          else
-            echo "Creating environment group '${ENVGROUP_NAME}' ..."
-            CREATE_URL="https://apigee.googleapis.com/v1/organizations/${APIGEE_PROJECT}/envgroups"
-            read -r -d '' CREATE_BODY <<EOF || true
-{
-  "name": "${ENVGROUP_NAME}"
-}
-EOF
-            CREATE_CODE=$(curl -s -o /tmp/_eg_create -w "%{http_code}" -X POST \
-              -H "${AUTH_HDR}" -H "Content-Type: application/json" \
-              -d "${CREATE_BODY}" "${CREATE_URL}" || true)
-
-            if [ "${CREATE_CODE}" = "200" ] || [ "${CREATE_CODE}" = "201" ]; then
-              echo "Environment group '${ENVGROUP_NAME}' created successfully."
-            else
-              echo "---- Apigee envgroup create response (HTTP ${CREATE_CODE}) ----"
-              sed -n '1,200p' /tmp/_eg_create || true
-              echo "---------------------------------------------------------------"
-              if [ "${CREATE_CODE}" = "403" ] || [ "${CREATE_CODE}" = "401" ]; then
-                echo "::error::Permission error creating envgroup. Ensure apigee.admin or required entitlements."
-              else
-                echo "::error::Failed to create envgroup (HTTP ${CREATE_CODE})."
-              fi
-              exit 7
+            if [ "$STATUS" == "FAILED" ]; then
+              echo "❌ Organization creation failed."
+              exit 1
             fi
+            sleep 30
+          done
+
+      - name: Verify Organization
+        run: |
+          echo "📋 Verifying organization..."
+          curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}" | jq .
+
+      # ------------------------------------------------------------
+      # STEP 3 : CREATE ENVIRONMENT GROUP (WITH VALIDATION)
+      # ------------------------------------------------------------
+      - name: Validate Existing Env Group
+        id: check_envgroup
+        run: |
+          EXISTING_GROUP=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" | jq -r '.name' 2>/dev/null || echo "")
+
+          if [[ "$EXISTING_GROUP" == "organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" ]]; then
+            echo "✅ Environment group '${ENV_GROUP}' already exists. Skipping creation."
+            echo "envgroup_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "envgroup_exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No existing environment group found. Proceeding with creation."
           fi
 
-      # End inserted Apigee org/envgroup steps
-      ############################################################################
-
-      - name: Create kubeconfig 
-        env:
-          PROJECT_ID: ${{ github.event.inputs.project_id }}
-          CLUSTER: helix-apigee-gke-nprd
-          LOCATION: us-west1
+      - name: Create Environment Group
+        if: steps.check_envgroup.outputs.envgroup_exists == 'false'
         run: |
-          # for private clusters reachable only internally, add --internal-ip
-          set -e
-          mkdir -p $GITHUB_WORKSPACE/.kube
-          export KUBECONFIG=$GITHUB_WORKSPACE/.kube/config
-          gcloud container clusters get-credentials "${CLUSTER}" \
-                --location="${LOCATION}" --project="${PROJECT_ID}" \
-                 --quiet
+          echo "🚀 Creating Environment Group: ${ENV_GROUP}"
 
-          echo "Kubeconfig generated at $KUBECONFIG"
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name":"'"${ENV_GROUP}"'",
+              "hostnames":["'"${HOSTNAME}"'"]
+            }' \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups")
 
-      - name: Use kubeconfig
-        env:
-         KUBECONFIG: ${{ github.workspace }}/.kube/config
-        run: kubectl get nodes --show-labels
-                
+          BODY=$(echo "$RESPONSE" | head -n1)
+          CODE=$(echo "$RESPONSE" | tail -n1)
 
-      # # --- Kubeconfig validation / write to file ---
-      # - name: Validate kubeconfig secret
-      #   run: |
-      #     if [ -z "${{ secrets.KUBECONFIG_BASE64 }}" ]; then
-      #       echo "ERROR: secrets.KUBECONFIG_BASE64 is required" >&2
-      #       exit 1
-      #     fi
-      #     echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 --decode > "${KUBECONFIG_PATH}"
-      #     chmod 600 "${KUBECONFIG_PATH}"
-      #     echo "Wrote kubeconfig to ${KUBECONFIG_PATH}"
+          if [ "$CODE" -ge 400 ]; then
+            echo "❌ Env group creation failed with HTTP $CODE"
+            echo "$BODY"
+            exit 1
+          fi
 
-      # # --- Fetch Secrets (placeholder) ---
-      # - name: Fetch Secrets
-      #   run: |
+          echo "✅ Environment group '${ENV_GROUP}' created successfully."
 
-
-      # - name: Ensure Namespace exists
-      #   run: |
-      #     ns="${{ github.event.inputs.namespace}}"
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" get namespace "${ns}" >/dev/null 2>&1 || kubectl --kubeconfig="${KUBECONFIG_PATH}" create namespace "${ns}"
-      #     echo "Using namespace: ${ns}"
-
-      # - name: Download Apigee Helm charts
-      #   run: |
-      #     set -e
-      #     mkdir -p "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
-      #     cd "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
-      #     export HELM_EXPERIMENTAL_OCI=1
-      #     helm pull "${CHART_REPO}/apigee-operator" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-datastore" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-env" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-ingress-manager" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-org" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-redis" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-telemetry" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     helm pull "${CHART_REPO}/apigee-virtualhost" --version "${{ github.event.inputs.chart_version }}" --untar
-      #     cd "${GITHUB_WORKSPACE}"
-      #     echo "Helm charts downloaded to ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}"
-
-      # - name: Create service account
-      #   env:
-      #     PROJECT_ID: ${{ github.event.inputs.project_id }}
-      #   run: |
-      #     set -e
-      #     TOOL="${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator/etc/tools/create-service-account"
-      #     if [ ! -f "${TOOL}" ]; then
-      #        echo "ERROR: create-service-account tool not found at ${TOOL}" >&2
-      #        exit 5
-      #     fi
-      #     chmod +x "${TOOL}" || true
-
-      #     # pick SA local-part depending on env
-      #     if [ "${{ github.event.inputs.env }}" = "non-prod" ] || [ "${{ github.event.inputs.env }}" = "nonprod" ]; then
-      #       SA_LOCAL="apigee-non-prod"
-      #     else
-      #       SA_LOCAL="apigee-datastore"
-      #     fi
-
-      #     SERVICE_ACCOUNT="${SA_LOCAL}@${PROJECT_ID}.iam.gserviceaccount.com"
-      #     echo "Checking if service account ${SERVICE_ACCOUNT} exists in project ${PROJECT_ID}..."
-      #     # fixed format string and grep; ensure gcloud present and authenticated
-      #     if gcloud iam service-accounts list --project="${PROJECT_ID}" --format='value(email)' | grep -q "^${SERVICE_ACCOUNT}$"; then
-      #       echo "Service account ${SERVICE_ACCOUNT} already exists. Skipping creation."
-      #     else
-      #       echo "Service account ${SERVICE_ACCOUNT} not found. Creating ${SERVICE_ACCOUNT} (non-interactive)..."
-      #       DEST_DIR="${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore"
-      #       mkdir -p "${DEST_DIR}"
-      #       yes | "${TOOL}"  --env non-prod  --dir "${DEST_DIR}" --project-id "${PROJECT_ID}"
-      #       echo "create-service-account finished."
-      #     fi
-
-      #     # verify SA JSON now exists in apigee-datastore and copy to other charts
-      #     SA_JSON="$(ls ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore/*.json 2>/dev/null | head -n1 || true)"
-      #     if [ -z "${SA_JSON}" ]; then
-      #       echo "ERROR: SA JSON not found in ${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-datastore after running tool (or tool skipped)." >&2
-      #       exit 6
-      #     fi
-      #     echo "Found SA JSON: ${SA_JSON}"
-         
-      #     # Copy the JSON to charts that need it (telemetry, org, env)
-      #     for target in apigee-telemetry apigee-org apigee-env; do
-      #       if [ -d "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/${target}" ]; then
-      #         cp -f "${SA_JSON}" "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/${target}/" || true
-      #         echo "Copied SA JSON to ${target}/"
-      #       fi
-      #     done
-
-      # - name: Ensure TLS Certificate Secret
-      #   run: |
-      #     set -e
-      #     NS="${{ github.event.inputs.namespace }}"
-
-
-      # - name: Prepare overrides.yaml
-      #   run: |
-      #     ENV="${{ github.event.inputs.env }}"
-      #     if [ -f "./templates/overrides.${ENV}.yaml" ]; then
-      #       cp "./templates/overrides.${ENV}.yaml" ./overrides.yaml
-      #     elif [ -f "./templates/overrides.yaml" ]; then
-      #       cp "./templates/overrides.yaml" ./overrides.yaml
-      #     else
-      #       echo "ERROR: overrides.yaml not found." >&2
-      #       exit 1
-      #     fi
-
-      # - name: Apply Apigee CRDs
-      #   run: |
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" apply -k "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator/etc/crds/default/"
-
-      # - name: Install cert-manager
-      #   run: |
-      #     if kubectl --kubeconfig="${KUBECONFIG_PATH}" -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
-      #       echo "cert-manager already installed."
-      #     else
-      #       echo "Installing cert-manager v1.12.0..."
-      #       kubectl --kubeconfig="${KUBECONFIG_PATH}" apply --validate=false -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
-      #       kubectl --kubeconfig="${KUBECONFIG_PATH}" -n cert-manager rollout status deploy/cert-manager --timeout=180s
-      #     fi
-      # - name: Install apigee-operator
-      #   run: |
-      #     set -e
-      #     cd "${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/apigee-operator"
-      #     if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-      #       helm upgrade apigee-operator . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --dry-run=server --debug
-      #     else
-      #       helm upgrade apigee-operator . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --wait --timeout 20m
-      #     fi
-
-      # - name: Install remaining Apigee charts
-      #   run: |
-      #     set -e
-      #     charts="apigee-datastore apigee-redis apigee-telemetry apigee-env apigee-ingress-manager apigee-virtualhost apigee-org"
-      #     for c in $charts; do
-      #       cd "${GITHUB_WORKSPACE}/${APIGEE_HYBRID_BASE}/${APIGEE_HELM_CHARTS_HOME}/$c"
-      #       if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-      #         helm upgrade "$c" . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --dry-run=server --debug
-      #       else
-      #         helm upgrade "$c" . --install --namespace "${{ github.event.inputs.namespace }}" -f "${GITHUB_WORKSPACE}/overrides.yaml" --atomic --wait --timeout 20m
-      #       fi
-      #     done
-
-      # - name: Post-install verification
-      #   run: |
-      #     ns="${{ github.event.inputs.namespace }}"
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get pods --show-labels || true
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get pvc || true
-      #     kubectl --kubeconfig="${KUBECONFIG_PATH}" -n "${ns}" get apigeeorg || true
-
-      # - name: Done
-      #   run: |
-      #     if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-      #       echo "Dry-run complete. Re-run with dry_run=false to perform install."
-      #     else
-      #       echo "Install finished."
-      #     fi
+      - name: Verify Environment Group
+        run: |
+          echo "📋 Verifying environment group..."
+          curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://apigee.googleapis.com/v1/organizations/${ORG_NAME}/environmentGroups/${ENV_GROUP}" | jq .
