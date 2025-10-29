@@ -8,19 +8,19 @@ on:
         required: true
         default: "eqx-entapg-nonprod"
       control_plane_location:
-        description: "Control Plane Location (e.g. us)"
+        description: "Control Plane Region (e.g. us, europe)"
         required: true
         default: "us"
       consumer_data_region:
-        description: "Consumer Data Region (e.g. us-west1)"
+        description: "Consumer Data Region (e.g. us-west1, europe-west1)"
         required: true
         default: "us-west1"
       runtime_type:
-        description: "Runtime Type (HYBRID)"
+        description: "Runtime Type"
         required: true
         default: "HYBRID"
       billing_type:
-        description: "Billing Type (SUBSCRIPTION)"
+        description: "Billing Type"
         required: true
         default: "SUBSCRIPTION"
 
@@ -94,6 +94,7 @@ jobs:
               "name": "'"${ORG_NAME}"'",
               "billingType": "'"${BILLING_TYPE}"'",
               "runtimeType": "'"${RUNTIMETYPE}"'",
+              "controlPlaneRegion": "'"${CONTROL_PLANE_LOCATION}"'",
               "apiConsumerDataLocation": "'"${CONSUMER_DATA_REGION}"'"
             }' \
             "https://${CONTROL_PLANE_LOCATION}-apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT}")
@@ -169,7 +170,13 @@ jobs:
 
           if echo "$ORG_INFO" | jq -e '.subscriptionType' >/dev/null 2>&1; then
             echo "✅ Organization details:"
-            echo "$ORG_INFO" | jq '{name, runtimeType, subscriptionType, billingType, apiConsumerDataLocation, state}'
+            echo "$ORG_INFO" | jq '{name, runtimeType, billingType, subscriptionType, controlPlaneRegion, apiConsumerDataLocation, state}'
+            SUB_TYPE=$(echo "$ORG_INFO" | jq -r '.subscriptionType')
+            if [ "$SUB_TYPE" = "EVAL" ]; then
+              echo "⚠️ Warning: This is a Trial (EVAL) org. Ensure entitlement is active for Paid Hybrid."
+            else
+              echo "✅ Organization is Paid (Hybrid-enabled)."
+            fi
           else
             echo "❌ Could not verify organization info."
             echo "$ORG_INFO"
