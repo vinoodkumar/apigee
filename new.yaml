@@ -86,39 +86,59 @@ jobs:
       # STEP 2 : CREATE APIGEE ORGANIZATION
       # ------------------------------------------------------------
       - name: Create Apigee Organization
-        if: steps.validate_org.outputs.org_exists == 'false'
-        id: create_org
-        run: |
-          echo "🚀 Creating Apigee organization: ${ORG_NAME}"
+  if: steps.validate_org.outputs.org_exists == 'false'
+  id: create_org
+  run: |
+    echo "🚀 Creating Apigee organization: ${ORG_NAME}"
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "name":"'"${ORG_NAME}"'",
-              "runtimeType":"'"${RUNTIMETYPE}"'",
-              "analyticsRegion":"'"${ANALYTICS_REGION}"'"
-            }' \
-            "https://apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT}")
+    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+      -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name":"'"${ORG_NAME}"'",
+        "runtimeType":"'"${RUNTIMETYPE}"'",
+        "analyticsRegion":"'"${ANALYTICS_REGION}"'"
+      }' \
+      "https://apigee.googleapis.com/v1/organizations?parent=projects/${APIGEE_PROJECT}")
 
-          BODY=$(echo "$RESPONSE" | head -n1)
-          CODE=$(echo "$RESPONSE" | tail -n1)
+    BODY=$(echo "$RESPONSE" | head -n1)
+    CODE=$(echo "$RESPONSE" | tail -n1)
 
-          if [ "$CODE" -ge 400 ]; then
-            echo "❌ Org creation failed with HTTP $CODE"
-            echo "$BODY"
-            exit 1
-          fi
+    echo "--------------------"
+    echo "HTTP Status: $CODE"
+    echo "Raw Response:"
+    echo "$BODY"
+    echo "--------------------"
 
-          LONG_OP=$(echo "$BODY" | grep -o '"operations/[^"]*' | sed 's/"operations\///')
-          if [ -z "$LONG_OP" ]; then
-            echo "⚠️ Could not parse long-running operation ID. Raw response:"
-            echo "$BODY"
-            exit 1
-          fi
+    # ✅ Handle known outcomes
+    if [ "$CODE" -eq 409 ]; then
+      echo "✅ Organization already exists. Skipping creation."
+      exit 0
+    elif [ "$CODE" -ge 400 ]; then
+      echo "❌ Org creation failed with HTTP $CODE"
+      if echo "$BODY" | jq -e '.error.message' >/dev/null 2>&1; then
+        echo "Error details:"
+        echo "$BODY" | jq '.error'
+      else
+        echo "Raw (non-JSON) response:"
+        echo "$BODY"
+      fi
+      exit 1
+    fi
 
-          echo "operation_id=$LONG_OP" >> $GITHUB_OUTPUT
-          echo "✅ Org creation initiated. Operation ID: $LONG_OP"
+    # ✅ Safely extract long-running operation ID
+    LONG_OP=$(echo "$BODY" | jq -r '.name' 2>/dev/null | awk -F'/' '{print $4}')
+
+    if [[ -z "$LONG_OP" || "$LONG_OP" == "null" ]]; then
+      echo "⚠️ Could not parse long-running operation ID."
+      echo "Raw response for debugging:"
+      echo "$BODY" | jq . || echo "$BODY"
+      exit 1
+    fi
+
+    echo "operation_id=$LONG_OP" >> $GITHUB_OUTPUT
+    echo "✅ Org creation initiated successfully. Operation ID: $LONG_OP"
+
 
       - name: Wait for Organization Creation
         if: steps.validate_org.outputs.org_exists == 'false'
