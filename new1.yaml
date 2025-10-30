@@ -1,4 +1,4 @@
-name: Apigee Hybrid - Create Org (Data Residency, Debug Safe)
+name: Apigee Hybrid - Create Org (Data Residency, Stable)
 
 on:
   workflow_dispatch:
@@ -76,9 +76,9 @@ jobs:
           fi
 
       # -------------------------------------------------------------------
-      # CREATE ORG (WITH FULL DEBUG LOGGING)
+      # CREATE ORG (WITH SMART 400 HANDLING)
       # -------------------------------------------------------------------
-      - name: Create Apigee Organization (Data Residency, Debug)
+      - name: Create Apigee Organization (Data Residency)
         if: steps.validate_org.outputs.org_exists == 'false'
         id: create_org
         run: |
@@ -109,14 +109,26 @@ jobs:
 
           BODY=$(echo "$RESPONSE" | head -n1)
           CODE=$(echo "$RESPONSE" | tail -n1)
+
           echo "HTTP Status: $CODE"
           echo "Raw Response:"
           echo "$BODY" | head -c 4000
           echo "----------------------------------------------------"
 
+          # Handle transient 400 (org creation completes asynchronously)
           if [ "$CODE" -ge 400 ]; then
-            echo "❌ Org creation failed with HTTP $CODE"
-            echo "Attempting to parse JSON error (if present)..."
+            echo "⚠️ Received HTTP $CODE. Checking if org was created anyway..."
+            ORG_STATE=$(curl -s \
+              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+              "https://${CONTROL_PLANE_LOCATION}-apigee.googleapis.com/v1/organizations/${ORG_NAME}" \
+              | jq -r '.state // empty')
+            
+            if [ "$ORG_STATE" == "ACTIVE" ]; then
+              echo "✅ Organization '${ORG_NAME}' is already ACTIVE. Continuing."
+              exit 0
+            fi
+
+            echo "❌ Org creation failed with HTTP $CODE and no ACTIVE org found."
             echo "$BODY" | jq . || echo "$BODY"
             exit 1
           fi
@@ -131,7 +143,7 @@ jobs:
           echo "✅ Operation ID: $LONG_OP"
 
       # -------------------------------------------------------------------
-      # WAIT FOR OPERATION
+      # WAIT FOR OPERATION COMPLETION
       # -------------------------------------------------------------------
       - name: Wait for Organization Creation
         if: steps.validate_org.outputs.org_exists == 'false'
@@ -149,10 +161,17 @@ jobs:
           done
 
       # -------------------------------------------------------------------
-      # VERIFY ORG
+      # VERIFY ORG STATUS
       # -------------------------------------------------------------------
       - name: Verify Organization
         run: |
           echo "📋 Checking final org status..."
-          curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-            "https://${CONTROL_PLANE_LOCATION}-apigee.googleapis.com/v1/organizations/${ORG_NAME}" | jq .
+          ORG_INFO=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://${CONTROL_PLANE_LOCATION}-apigee.googleapis.com/v1/organizations/${ORG_NAME}")
+          echo "$ORG_INFO" | jq '{name, state, runtimeType, subscriptionType, billingType, apiConsumerDataLocation}'
+          STATE=$(echo "$ORG_INFO" | jq -r '.state // empty')
+          if [ "$STATE" != "ACTIVE" ]; then
+            echo "❌ Org not in ACTIVE state."
+            exit 1
+          fi
+          echo "✅ Organization '${ORG_NAME}' verified successfully."
