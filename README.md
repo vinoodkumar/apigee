@@ -1,18 +1,50 @@
-Apigee Hybrid Org Creation – Root Cause Identified
+***
+  "name": "eqx-entapg-nonprod",
+  "createdAt": "1761801935034",
+  "lastModifiedAt": "1761801939027",
+  "properties": ***
+    "property": [
+      ***
+        "name": "features.mart.connect.enabled",
+        "value": "true"
+      ***,
+      ***
+        "name": "features.hybrid.enabled",
+        "value": "true"
+      ***
+    ]
+  ***,
+  "runtimeType": "HYBRID",
+  "subscriptionType": "PAID",
+  "projectId": "eqx-entapg-nonprod",
+  "state": "ACTIVE",
+  "billingType": "SUBSCRIPTION",
+  "addonsConfig": ***,
+  "apiConsumerDataLocation": "us-west1",
+  "apigeeProjectId": "oba37baeed5a6fbd3-tp",
+  "subscriptionPlan": "SUBSCRIPTION_2021"
+***
 
-I completed end-to-end testing of the Apigee Hybrid org creation workflow.
-The payload and API endpoint are correct and the call successfully reaches the Apigee control plane (us-apigee.googleapis.com).
-Audit logs confirm the request was authorized and executed by our service account:
-sa-hlx-apigee-deploy-nprd@eqx-helix-svc-act-dev.iam.gserviceaccount.com.
 
-However, the Apigee API responded with a “failed precondition” error:
-
-no entitlements are found for organization eqx-entapg-nonprod.
-Select a different billing type or contact Apigee Sales to entitle the organization.
-
-This means that while the project eqx-entapg-nonprod has Apigee API access,
-it does not have an active Apigee Hybrid (Subscription) entitlement under its current billing account.
-
-I’ve already spoken with the GCP team — they’ve reviewed the audit logs and will raise a support case after checking internally with Dhanraj to have the entitlement enabled.
-
-Once the entitlement is active, the same workflow will work without any changes.
+🚀 Creating Apigee Organization...
+Control Plane: us
+Consumer Region: us-west1
+Project: eqx-entapg-nonprod
+----------------------------------------------------
+📦 Payload being sent:
+***
+  "name": "eqx-entapg-nonprod",
+  "billingType": "SUBSCRIPTION",
+  "runtimeType": "HYBRID",
+  "apiConsumerDataLocation": "us-west1"
+***
+----------------------------------------------------
+HTTP Status: 400
+Raw Response:
+***
+----------------------------------------------------
+❌ Org creation failed with HTTP 400
+Attempting to parse JSON error (if present)...
+parse error: Unfinished JSON term at EOF at line 2, column 0
+***
+Error: Process completed with exit code 1.
